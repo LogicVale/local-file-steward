@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>静谧时光 · 优美页面</title>
+    <style>
+        :root {
+            --bg: #f7f5f2;
+            --card: #ffffff;
+            --text: #2d2a26;
+            --muted: #8a837b;
+            --accent: #b87b5a;
+            --accent-soft: #e8d5c7;
+            --line: #ece7e0;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px 20px;
+        }
+
+        .hero {
+            text-align: center;
+            margin-bottom: 48px;
+        }
+
+        .hero .tag {
+            display: inline-block;
+            font-size: 13px;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: var(--accent-soft);
+            padding: 6px 18px;
+            border-radius: 30px;
+            margin-bottom: 22px;
+        }
+
+        .hero h1 {
+            font-size: clamp(2.2rem, 6vw, 4rem);
+            font-weight: 300;
+            letter-spacing: 2px;
+            color: var(--text);
+            margin-bottom: 14px;
+        }
+
+        .hero h1 span {
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .hero p {
+            color: var(--muted);
+            font-size: 1.05rem;
+            max-width: 520px;
+            margin: 0 auto;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 24px;
+            max-width: 900px;
+            width: 100%;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            padding: 34px 28px;
+            box-shadow: 0 10px 30px rgba(45, 42, 38, 0.04);
+            transition: transform 0.35s ease, box-shadow 0.35s ease;
+            cursor: default;
+        }
+
+        .card:hover {
+            transform: translateY(-6px);
+            box-shadow: 0 22px 44px rgba(45, 42, 38, 0.1);
+        }
+
+        .card .icon {
+            font-size: 2.4rem;
+            margin-bottom: 18px;
+            display: block;
+        }
+
+        .card h2 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+            letter-spacing: 1px;
+        }
+
+        .card p {
+            color: var(--muted);
+            font-size: 0.95rem;
+        }
+
+        footer {
+            margin-top: 56px;
+            color: var(--muted);
+            font-size: 0.85rem;
+            letter-spacing: 1px;
+        }
+
+        .divider {
+            width: 60px;
+            height: 3px;
+            background: var(--accent);
+            border-radius: 3px;
+            margin: 26px auto;
+        }
+    </style>
+</head>
+<body>
+    <header class="hero">
+        <span class="tag">Serene Moment</span>
+        <h1>静谧的<span>美好时光</span></h1>
+        <div class="divider"></div>
+        <p>在喧嚣之中，留一方宁静给自己。感受光影流转，品味生活本真的温柔与诗意。</p>
+    </header>
+
+    <main class="grid">
+        <section class="card">
+            <span class="icon">🌸</span>
+            <h2>自然之美</h2>
+            <p>春有百花秋有月，夏有凉风冬有雪。四时之景不同，而乐亦无穷也。</p>
+        </section>
+        <section class="card">
+            <span class="icon">☕</span>
+            <h2>生活之味</h2>
+            <p>一壶清茶，一本好书，一段不被打扰的午后时光，便是人间至味。</p>
+        </section>
+        <section class="card">
+            <span class="icon">✨</span>
+            <h2>心灵之静</h2>
+            <p>真正的宁静并非远离喧嚣，而是在内心的深处修篱种菊。</p>
+        </section>
+    </main>
+
+    <footer>愿你在平凡的日子里，也能遇见不平凡的美</footer>
+</body>
+</html>
