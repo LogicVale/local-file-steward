@@ -5,13 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"my_agent/core"
 	"my_agent/mcpclient"
 	"my_agent/mcpserver"
+	"my_agent/memory"
+	"my_agent/skills"
 	"my_agent/tools"
 
 	"github.com/openai/openai-go/v3"
@@ -20,6 +24,25 @@ import (
 )
 
 const MaxLoop = 10
+
+// dangerousTools 是会修改文件系统的工具集合，执行前必须获得用户确认
+var dangerousTools = map[string]bool{
+	"write_file":  true,
+	"rename_file": true,
+	"create_file": true,
+}
+
+// confirmToolAction 打印危险工具将要执行的内容并阻塞等待用户确认。
+// 返回 true 表示确认执行，false 表示取消。
+func confirmToolAction(scanner *bufio.Scanner, toolName, argsJSON string) bool {
+	fmt.Printf("\n⚠️  即将执行 %s，参数：\n    %s\n", toolName, argsJSON)
+	fmt.Print("   确认执行？(y/N): ")
+	if !scanner.Scan() {
+		return false
+	}
+	answer := strings.TrimSpace(strings.ToLower(scanner.Text()))
+	return answer == "y" || answer == "yes"
+}
 
 // getLlmTools 注册智能体可用的工具
 func getLlmTools() map[string]*tools.ToolDef {
@@ -48,8 +71,10 @@ func buildOpenaiTools(ts map[string]*tools.ToolDef) []responses.ToolUnionParam {
 	return openaiTools
 }
 
-// runOnce 执行一轮对话：把用户输入交给 LLM，循环处理工具调用，直到 LLM 给出最终回答
-func runOnce(ctx context.Context, client openai.Client, session *core.Session, llmTools map[string]*tools.ToolDef, openaiTools []responses.ToolUnionParam) {
+// runOnce 执行一轮对话：把用户输入交给 LLM，循环处理工具调用，直到 LLM 给出最终回答。
+// scanner 用于危险工具执行前的用户确认；传 nil 则跳过确认（如 MCP 无交互场景）。
+// 返回值表示是否正常结束（false 表示 maxLoop 或错误，不应生成摘要）。
+func runOnce(ctx context.Context, client openai.Client, session *core.Session, llmTools map[string]*tools.ToolDef, openaiTools []responses.ToolUnionParam, scanner *bufio.Scanner) {
 	for realLoop := 0; realLoop <= MaxLoop; realLoop++ {
 		resp, err := client.Responses.New(ctx, responses.ResponseNewParams{
 			Input: responses.ResponseNewParamsInputUnion{
@@ -93,8 +118,28 @@ func runOnce(ctx context.Context, client openai.Client, session *core.Session, l
 				})
 
 				// 执行工具
-				if v, ok := llmTools[item.AsFunctionCall().Name]; ok {
-					toolRe, err := v.Call(ctx, item.AsFunctionCall().Arguments)
+				toolName := item.AsFunctionCall().Name
+				argsJSON := item.AsFunctionCall().Arguments
+
+				// 危险工具执行前阻塞确认
+				if dangerousTools[toolName] && scanner != nil {
+					if !confirmToolAction(scanner, toolName, argsJSON) {
+						toolRe := "用户取消了这次操作。请向用户说明：操作已取消，如需继续请明确授权后再调用。"
+						fmt.Printf("[用户取消] %s\n", toolName)
+						session.AddMessage(responses.ResponseInputItemUnionParam{
+							OfFunctionCallOutput: &responses.ResponseInputItemFunctionCallOutputParam{
+								Output: responses.ResponseInputItemFunctionCallOutputOutputUnionParam{
+									OfString: openai.String(toolRe),
+								},
+								CallID: openai.String(item.AsFunctionCall().CallID),
+							},
+						})
+						continue
+					}
+				}
+
+				if v, ok := llmTools[toolName]; ok {
+					toolRe, err := v.Call(ctx, argsJSON)
 					if err != nil {
 						toolRe = fmt.Sprintf("执行出错: %v", err)
 					}
@@ -114,12 +159,39 @@ func runOnce(ctx context.Context, client openai.Client, session *core.Session, l
 		}
 
 		if !hasToolCall {
-			// 没有工具调用，说明 LLM 已经给出最终回答
 			fmt.Println("\n[助手]", resp.OutputText())
 			return
 		}
 	}
 	fmt.Println("已达到最大循环次数，对话结束。")
+}
+
+// generateSessionSummary 在会话即将结束时被调用，拉一次 LLM 对整个 session 做汇总。
+// 超时（6s）或网络错误静默忽略，不阻塞主流程退出。
+func generateSessionSummary(ctx context.Context, client openai.Client, session *core.Session) string {
+	msgs := session.GetMessages()
+
+	summaryCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+
+	resp, err := client.Responses.New(summaryCtx, responses.ResponseNewParams{
+		Input: responses.ResponseNewParamsInputUnion{
+			OfInputItemList: append([]responses.ResponseInputItemUnionParam{
+				responses.ResponseInputItemParamOfMessage(
+					"请对以上整段会话做 2-5 行中文总结，格式："+
+						"用户主要诉求 → 做了哪些操作（用了哪些工具）→ 结果如何（成功/待确认/未完成）。"+
+						"如果会话里用户明确表达了稳定偏好（如'喜欢深色主题'），请在末尾单独一行列出。"+
+						"只写事实，不要写观点。",
+					responses.EasyInputMessageRoleUser,
+				),
+			}, msgs...),
+		},
+		Model: "deepseek-v4-pro",
+	})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(resp.OutputText())
 }
 
 func main() {
@@ -135,21 +207,60 @@ func main() {
 
 	session := core.NewSession()
 
-	// 系统提示词：定义智能体的身份和行为
+	// 加载技能：扫描 skills 目录，技能清单会注入系统提示词
+	skillList, err := skills.LoadAll("skills")
+	if err != nil {
+		fmt.Printf("[Skill] 加载技能失败: %v\n", err)
+	}
+	skillReg := skills.NewRegistry(skillList)
+
+	// 初始化长期记忆（独立于 skills 包，全局唯一）
+	memMgr, err := memory.New("memory/summaries.md")
+	if err != nil {
+		fmt.Printf("[Memory] 初始化失败: %v\n", err)
+		memMgr = nil
+	}
+
+	// 系统提示词
+	systemPrompt := "你是一个本地文件小管家智能体，负责帮用户管理本地工作区的文件。" +
+		"你可以通过工具列出目录、读取文件内容、重命名文件、创建新文件、向文件写入内容。" +
+		"所有操作都被限制在工作区目录内。请用简洁的中文回答用户，操作前先说明你要做什么。" +
+		"\n\n## 安全守则（必须遵守）\n" +
+		"以下操作属于文件系统修改：write_file、rename_file、create_file。\n" +
+		"执行这些操作前，必须先向用户展示完整的变更计划（改什么、怎么改、改后会是什么样），" +
+		"等用户明确确认后再调用工具。不要一次偷偷调多个写操作工具——一次一个，等用户确认一个再调下一个。\n" +
+		"即使用户说可以直接改，每步修改仍然会在执行前被拦截确认，请按提示输入 y 或 n。"
+
+	// 注入长期记忆（如果有）
+	if memMgr != nil {
+		if mem := memMgr.LoadForPrompt(); mem != "" {
+			systemPrompt += "\n\n## 已记住的用户偏好和最近会话\n" + mem
+		}
+	}
+
+	if section := skillReg.PromptSection(); section != "" {
+		systemPrompt += "\n\n" + section
+	}
 	session.AddMessage(
 		responses.ResponseInputItemParamOfMessage(
-			"你是一个本地文件小管家智能体，负责帮用户管理本地工作区的文件。"+
-				"你可以通过工具列出目录、读取文件内容、重命名文件、创建新文件、向文件写入内容。"+
-				"所有操作都被限制在工作区目录内。请用简洁的中文回答用户，操作前先说明你要做什么。",
+			systemPrompt,
 			responses.EasyInputMessageRoleSystem),
 	)
 
 	llmTools := getLlmTools()
 
 	ctx := context.Background()
+
+	// 强制直连：Transport 的 Proxy 设为 nil，忽略 HTTP_PROXY/HTTPS_PROXY 环境变量，
+	// 避免本地代理(如 Clash 127.0.0.1:7890)拦截导致请求失败。DeepSeek 是国内服务，无需代理。
+	noProxyClient := &http.Client{
+		Transport: &http.Transport{Proxy: nil},
+		Timeout:   30 * time.Second,
+	}
 	client := openai.NewClient(
-		option.WithAPIKey("sk-6bfb8d3d3c7445e29d0dc735a2fd44db"),
+		option.WithAPIKey("sk-aa605b7053a749f0b1af0cd711d09ca1"),
 		option.WithBaseURL("https://api.deepseek.com"),
+		option.WithHTTPClient(noProxyClient),
 		option.WithRequestTimeout(30*time.Second),
 	)
 
@@ -166,13 +277,33 @@ func main() {
 		llmTools[name] = td
 	}
 
+	// 有技能时才注册 load_skill 工具
+	skillToolCount := 0
+	if skillReg.Len() > 0 {
+		loadSkill := skillReg.LoadTool()
+		llmTools[loadSkill.Name] = loadSkill
+		skillToolCount = 1
+	}
+
 	// 合并完 MCP 工具后再生成发给 LLM 的工具清单
 	openaiTools := buildOpenaiTools(llmTools)
 
 	fmt.Println("===== 本地文件小管家智能体 =====")
 	fmt.Printf("工作区目录: %s\n", tools.WorkspaceDir)
-	fmt.Printf("已注册工具 %d 个（内置 %d 个 + MCP %d 个）\n",
-		len(llmTools), len(llmTools)-len(mcpTools), len(mcpTools))
+	fmt.Printf("已注册工具 %d 个（内置 %d 个 + MCP %d 个 + 技能 %d 个）\n",
+		len(llmTools), len(llmTools)-len(mcpTools)-skillToolCount, len(mcpTools), skillToolCount)
+	if skillReg.Len() > 0 {
+		fmt.Printf("已加载技能 %d 个:\n", skillReg.Len())
+		for _, s := range skillReg.List() {
+			fmt.Printf("  [Skill] %s - %s\n", s.Name, s.Description)
+		}
+	}
+	if memMgr != nil {
+		if st := memMgr.Stats(); st.Bytes > 0 {
+			fmt.Printf("长期记忆 %d B（%d 条摘要，有偏好：%v）→ %s\n",
+				st.Bytes, st.SummaryCount, st.HasPrefs, st.Path)
+		}
+	}
 	mcpNames := make([]string, 0, len(mcpTools))
 	for name := range mcpTools {
 		mcpNames = append(mcpNames, name)
@@ -191,18 +322,28 @@ func main() {
 		}
 		userInput := scanner.Text()
 		if userInput == "quit" || userInput == "exit" {
-			fmt.Println("再见！")
 			break
 		}
 		if userInput == "" {
 			continue
 		}
 
-		// 把用户输入加入会话
 		session.AddMessage(
 			responses.ResponseInputItemParamOfMessage(userInput, responses.EasyInputMessageRoleUser),
 		)
-		// 执行一轮
-		runOnce(ctx, client, session, llmTools, openaiTools)
+		runOnce(ctx, client, session, llmTools, openaiTools, scanner)
 	}
+
+	// 会话即将结束（正常退出或 Ctrl+D），对整个 session 生成一条汇总
+	if memMgr != nil {
+		fmt.Println("\n[记忆] 正在整理本次会话...")
+		if summary := generateSessionSummary(ctx, client, session); summary != "" {
+			if err := memMgr.AppendSummary(summary); err != nil {
+				fmt.Printf("[Memory] 写入会话摘要失败: %v\n", err)
+			} else {
+				fmt.Printf("[记忆] 本次会话已归档\n")
+			}
+		}
+	}
+	fmt.Println("再见！")
 }
