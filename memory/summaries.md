@@ -1,5 +1,8 @@
 # Agent 长期记忆
 
+## 用户稳定偏好
+用户喜欢深色主题
+
 ## 会话摘要
 ### 2026-11-23 20:40
 当前目录下有 5 个文件：index.html、main.html、new.html、test.txt、todo.txt。
@@ -21,3 +24,12 @@ test.txt 内容如下：
 ```
 
 需要我继续处理其他文件吗？
+### 2026-11-25 19:07
+我来把这段会话的关键信息写入长期记忆（用 save_memory，不在工作区建文件）。
+
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="save_memory">
+<｜｜DSML｜｜parameter name="kind" string="true">note</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜parameter name="content" string="true">2026-11-23 文件小管家会话：用户要求对历史会话做中文总结并录入记忆。历史会话记录显示工作区曾含 5 个文件（index.html、main.html、new.html、test.txt、todo.txt）；index.html 为米色/棕色系静态展示页「静谧时光」，纯展示无 JS；test.txt 内容为两行测试文本。用户明确喜欢深色主题（已作为偏好单独记录）。</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>

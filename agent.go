@@ -25,6 +25,18 @@ import (
 
 const MaxLoop = 10
 
+// modelName 从环境变量 DEEPSEEK_MODEL 读取，默认 deepseek-v4-pro。
+// 在 main 中初始化，供 runOnce / generateSessionSummary 共享。
+var modelName = "deepseek-v4-pro"
+
+// getEnvOr 读环境变量，未设置则返回 fallback。
+func getEnvOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // dangerousTools 是会修改文件系统的工具集合，执行前必须获得用户确认
 var dangerousTools = map[string]bool{
 	"write_file":  true,
@@ -62,6 +74,47 @@ func getLlmTools() map[string]*tools.ToolDef {
 	return llmTools
 }
 
+// newSaveMemoryTool 创建 save_memory 工具，让模型能把信息写入长期记忆。
+// kind=preference 写入"用户稳定偏好"区；kind=summary 追加一条带时间戳的摘要。
+func newSaveMemoryTool(memMgr *memory.Manager) *tools.ToolDef {
+	return &tools.ToolDef{
+		Name:        "save_memory",
+		Description: "把需要长期记住的信息写入智能体的长期记忆。当用户明确要求记住某件事、录入记忆、保存偏好时调用。",
+		Params: openai.FunctionParameters{
+			"type": "object",
+			"properties": map[string]any{
+				"content": map[string]string{
+					"type":        "string",
+					"description": "要记住的内容，简明扼要",
+				},
+				"kind": map[string]any{
+					"type":        "string",
+					"enum":        []string{"preference", "summary"},
+					"description": "preference=用户稳定偏好（长期有效）；summary=一次性的事实记录",
+				},
+			},
+			"required": []string{"content", "kind"},
+		},
+		Fn: func(ctx context.Context, args map[string]any) (string, error) {
+			content, _ := args["content"].(string)
+			kind, _ := args["kind"].(string)
+			if content == "" {
+				return "", fmt.Errorf("参数 content 必填")
+			}
+			if kind == "summary" {
+				if err := memMgr.AppendSummary(content); err != nil {
+					return "", err
+				}
+			} else {
+				if err := memMgr.AppendPreferences(content); err != nil {
+					return "", err
+				}
+			}
+			return "已写入长期记忆", nil
+		},
+	}
+}
+
 // buildOpenaiTools 把工具转成 OpenAI API 要求的格式
 func buildOpenaiTools(ts map[string]*tools.ToolDef) []responses.ToolUnionParam {
 	openaiTools := make([]responses.ToolUnionParam, 0)
@@ -81,7 +134,7 @@ func runOnce(ctx context.Context, client openai.Client, session *core.Session, l
 				OfInputItemList: session.GetMessages(),
 			},
 			Tools: openaiTools,
-			Model: "deepseek-v4-pro",
+			Model: modelName,
 		})
 
 		if err != nil {
@@ -167,11 +220,11 @@ func runOnce(ctx context.Context, client openai.Client, session *core.Session, l
 }
 
 // generateSessionSummary 在会话即将结束时被调用，拉一次 LLM 对整个 session 做汇总。
-// 超时（6s）或网络错误静默忽略，不阻塞主流程退出。
+// 失败只打印原因，不阻塞主流程退出。
 func generateSessionSummary(ctx context.Context, client openai.Client, session *core.Session) string {
 	msgs := session.GetMessages()
 
-	summaryCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	summaryCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	resp, err := client.Responses.New(summaryCtx, responses.ResponseNewParams{
@@ -186,9 +239,10 @@ func generateSessionSummary(ctx context.Context, client openai.Client, session *
 				),
 			}, msgs...),
 		},
-		Model: "deepseek-v4-pro",
+		Model: modelName,
 	})
 	if err != nil {
+		fmt.Println("[记忆] 摘要生成失败:", err)
 		return ""
 	}
 	return strings.TrimSpace(resp.OutputText())
@@ -229,7 +283,11 @@ func main() {
 		"以下操作属于文件系统修改：write_file、rename_file、create_file。\n" +
 		"执行这些操作前，必须先向用户展示完整的变更计划（改什么、怎么改、改后会是什么样），" +
 		"等用户明确确认后再调用工具。不要一次偷偷调多个写操作工具——一次一个，等用户确认一个再调下一个。\n" +
-		"即使用户说可以直接改，每步修改仍然会在执行前被拦截确认，请按提示输入 y 或 n。"
+		"即使用户说可以直接改，每步修改仍然会在执行前被拦截确认，请按提示输入 y 或 n。" +
+		"\n\n## 记忆机制\n" +
+		"你有长期记忆，由系统在会话结束时自动归档，会话开始时相关内容已注入上文。\n" +
+		"当用户要求记住某事、录入记忆或保存偏好时，调用 save_memory 工具写入；" +
+		"不要在 workspace 里创建 memory.md 等文件来记录——那不是长期记忆，程序不会读取它。"
 
 	// 注入长期记忆（如果有）
 	if memMgr != nil {
@@ -249,19 +307,36 @@ func main() {
 
 	llmTools := getLlmTools()
 
+	// 注册记忆写入工具（依赖 memMgr，需在其初始化之后）
+	if memMgr != nil {
+		saveMem := newSaveMemoryTool(memMgr)
+		llmTools[saveMem.Name] = saveMem
+	}
+
 	ctx := context.Background()
+
+	// 从环境变量读取配置（避免硬编码）
+	apiKey := os.Getenv("DEEPSEEK_API_KEY")
+	if apiKey == "" {
+		fmt.Fprintln(os.Stderr, "❌ 缺少环境变量 DEEPSEEK_API_KEY")
+		fmt.Fprintln(os.Stderr, "   请先设置：$env:DEEPSEEK_API_KEY='你的key'")
+		fmt.Fprintln(os.Stderr, "   或复制 .env.example 为 .env 后填写")
+		os.Exit(1)
+	}
+	baseURL := getEnvOr("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+	modelName = getEnvOr("DEEPSEEK_MODEL", modelName)
 
 	// 强制直连：Transport 的 Proxy 设为 nil，忽略 HTTP_PROXY/HTTPS_PROXY 环境变量，
 	// 避免本地代理(如 Clash 127.0.0.1:7890)拦截导致请求失败。DeepSeek 是国内服务，无需代理。
 	noProxyClient := &http.Client{
 		Transport: &http.Transport{Proxy: nil},
-		Timeout:   30 * time.Second,
+		Timeout:   5 * time.Minute,
 	}
 	client := openai.NewClient(
-		option.WithAPIKey("sk-aa605b7053a749f0b1af0cd711d09ca1"),
-		option.WithBaseURL("https://api.deepseek.com"),
+		option.WithAPIKey(apiKey),
+		option.WithBaseURL(baseURL),
 		option.WithHTTPClient(noProxyClient),
-		option.WithRequestTimeout(30*time.Second),
+		option.WithRequestTimeout(5*time.Minute),
 	)
 
 	// 接入 MCP 服务器：读取 mcp.json，连接服务器并发现其工具
